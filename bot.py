@@ -1,4 +1,4 @@
-"""Radmir Farm Bot v3.3.1 price-menu hotfix. Python 3.10+, aiogram 3.x, SQLite."""
+"""Radmir Farm Bot v3.3.2 deployment diagnostic. Python 3.10+, aiogram 3.x, SQLite."""
 import asyncio
 import logging
 import os
@@ -430,6 +430,12 @@ async def edit(q,text,markup):
 app=Dispatcher()
 def allowed(user): return not ALLOWED_ID or ALLOWED_ID==user
 
+BOT_VERSION = '3.3.2'
+
+@app.message(Command('version'))
+async def show_version(message: Message):
+    await message.answer(f'🌱 Radmir Farm Bot v{BOT_VERSION}\nМеню цен: диагностическая сборка')
+
 @app.message(Command('id'))
 async def user_id(message: Message):
     await message.answer(f'Ваш Telegram ID: <code>{message.from_user.id}</code>',parse_mode='HTML')
@@ -692,6 +698,7 @@ async def actions(q: CallbackQuery):
         elif key=='stock':
             text,kb=stock_menu(u); await edit(q,text,kb)
         elif key=='prices':
+            logging.info('PRICE_MENU_OPEN version=%s user=%s data=%s', BOT_VERSION, u, q.data)
             text,kb=prices_menu(u); await edit(q,text,kb)
         elif key=='price':
             sku=args[1]; assert valid_item(u,sku)
@@ -766,6 +773,7 @@ async def main():
     if not TOKEN or TOKEN=='PASTE_YOUR_BOT_TOKEN_HERE':
         raise SystemExit('Configure BOT_TOKEN in Replit Secrets / .env')
     logging.basicConfig(level=logging.INFO)
+    logging.warning('RADMIR_FARM_ACTIVE_VERSION=%s PID=%s', BOT_VERSION, os.getpid())
     bot=Bot(TOKEN)
     task=asyncio.create_task(notifier(bot))
     try:
