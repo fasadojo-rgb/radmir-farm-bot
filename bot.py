@@ -1,4 +1,4 @@
-"""Radmir Farm Bot v3. Python 3.10+, aiogram 3.x, SQLite."""
+"""Radmir Farm Bot v3.3.1 price-menu hotfix. Python 3.10+, aiogram 3.x, SQLite."""
 import asyncio
 import logging
 import os
@@ -338,13 +338,19 @@ def unit_price(user, sku):
     return custom['price'] if custom else PRICES.get(sku)
 
 def prices_menu(user):
-    lines=['⚙️ <b>ЦЕНЫ МАТЕРИАЛОВ</b>','━━━━━━━━━━━━━━━━━━',
-           'Выбери материал, чтобы изменить цену <b>за одну штуку</b>.',
-           'При пополнении склада цена будет подставляться автоматически.\n']
-    for sku,name in stock_items(user).items():
-        price=unit_price(user,sku)
-        lines.append(f'{name}: <b>{money(price) if price is not None else "не задана ⚠️"}</b>')
-    return '\n'.join(lines), keyboard([[(name,f'price:{sku}')] for sku,name in stock_items(user).items()]+[[('⬅️ Склад','stock')]])
+    """Build the price editor using a single snapshot of available stock items."""
+    items = list(stock_items(user).items())
+    lines = ['⚙️ <b>НАСТРОЙКА ЦЕН</b>', '━━━━━━━━━━━━━━━━━━',
+             'Выбери товар для изменения цены <b>за одну штуку</b>.',
+             'При пополнении склада общая стоимость считается автоматически.\n']
+    rows = []
+    for sku, name in items:
+        value = unit_price(user, sku)
+        shown_price = money(value) if value is not None else 'не задана ⚠️'
+        lines.append(f'{html.escape(str(name))}: <b>{shown_price}</b>')
+        rows.append([(str(name)[:60], f'price:{sku}')])
+    rows.append([('⬅️ Склад', 'stock')])
+    return '\n'.join(lines), keyboard(rows)
 
 def units(user,sku):
     return db.execute('SELECT COALESCE(SUM(quantity),0) FROM stock_moves WHERE user_id=? AND sku=?', (user,sku)).fetchone()[0]
@@ -705,8 +711,9 @@ async def actions(q: CallbackQuery):
         else:
             return await q.answer('Неизвестная кнопка',show_alert=True)
         await q.answer()
-    except (ValueError,IndexError,AssertionError):
-        await q.answer('Неверные данные кнопки',show_alert=True)
+    except (ValueError, IndexError, AssertionError) as exc:
+        logging.exception('Callback failed: key=%r data=%r user=%s', key, q.data, u)
+        await q.answer('Ошибка обработки кнопки. Подробности в логах Bothost.', show_alert=True)
 
 async def notifier(bot):
     while True:
