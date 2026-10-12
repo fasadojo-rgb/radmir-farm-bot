@@ -34,6 +34,7 @@ PRICES = {'seed_tomato': 875/20, 'seed_cucumber': 875/20,
           'lime': 4375/20, 'compost': 5250/20, 'herbicide': 7000/20, 'shovel': 9625/20}
 # Other seed prices are not verified; don't silently invent a price.
 
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 db = sqlite3.connect(DB_PATH)
 db.row_factory = sqlite3.Row
 db.execute('PRAGMA journal_mode=WAL')
@@ -102,6 +103,19 @@ def initialize():
         db.execute('''UPDATE plant_extras SET carrot_bonus=1 WHERE plant_id IN
             (SELECT id FROM plants p WHERE p.crop='pepper' AND EXISTS
             (SELECT 1 FROM plants c WHERE c.user_id=p.user_id AND c.garden=p.garden AND c.crop='carrot'))''')
+    db.execute('CREATE TABLE IF NOT EXISTS custom_stock_items (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1)')
+    db.execute('CREATE TABLE IF NOT EXISTS hidden_stock_items (user_id INTEGER NOT NULL, sku TEXT NOT NULL, PRIMARY KEY(user_id,sku))')
+    cols={r[1] for r in db.execute('PRAGMA table_info(plants)')}
+    if 'grown_seconds' not in cols:
+        db.execute('ALTER TABLE plants ADD COLUMN grown_seconds INTEGER NOT NULL DEFAULT 0')
+        db.execute('ALTER TABLE plants ADD COLUMN growth_synced_at INTEGER NOT NULL DEFAULT 0')
+        # Historic missed-water timestamps are unavailable: grant at most one interval.
+        for crop,(_,_,interval) in CROPS.items():
+            db.execute('UPDATE plants SET grown_seconds=MAX(0,MIN(watered_at-planted_at,?)),growth_synced_at=watered_at WHERE crop=?',(interval*60,crop))
+    cols={r[1] for r in db.execute('PRAGMA table_info(water_action_items)')}
+    for col in ('prev_grown_seconds','prev_growth_synced_at'):
+        if col not in cols:
+            db.execute(f'ALTER TABLE water_action_items ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0')
     db.execute('CREATE INDEX IF NOT EXISTS ix_plants_user_garden ON plants(user_id,garden)')
     db.commit()
 
@@ -132,21 +146,25 @@ def get_plants(user,g=None):
         return db.execute('SELECT * FROM plants WHERE user_id=? ORDER BY garden,crop,id',(user,)).fetchall()
     return db.execute('SELECT * FROM plants WHERE user_id=? AND garden=? ORDER BY crop,id',(user,g)).fetchall()
 def get_plant(user,pid): return db.execute('SELECT * FROM plants WHERE id=? AND user_id=?',(pid,user)).fetchone()
-def grow_at(p): return p['planted_at']+CROPS[p['crop']][1]*60
 def due_at(p): return p['watered_at']+CROPS[p['crop']][2]*60
-def progress(p): return min(100,max(0,int((clock()-p['planted_at'])*100/(CROPS[p['crop']][1]*60))))
+def growth_seconds(p, now=None):
+    now=clock() if now is None else now
+    start=max(p['watered_at'],p['growth_synced_at'])
+    return min(CROPS[p['crop']][1]*60,p['grown_seconds']+max(0,min(now,due_at(p))-start))
+def is_ready(p): return growth_seconds(p)>=CROPS[p['crop']][1]*60
+def progress(p): return min(100,int(100*growth_seconds(p)/(CROPS[p['crop']][1]*60)))
 def average_progress(ps): return round(sum(progress(p) for p in ps)/len(ps)) if ps else 0
 def garden_summary(user,g):
     ps=get_plants(user,g); count=len(ps); names=Counter(p['crop'] for p in ps)
     result=[f'🌱 <b>Огород №{g}</b>', f'🪴 Заполнено: {count}/{CAPACITY} ({count*5}%)',
             f'📈 Средний рост: {average_progress(ps)}%']
     result += [f'{CROPS[c][0]} ×{q}' for c,q in names.items()]
-    active=[p for p in ps if grow_at(p)>clock()]
+    active=[p for p in ps if not is_ready(p)]
     if active:
         due=min(due_at(p) for p in active)
         result.append('💧 Полив: '+('просрочен' if due<=clock() else 'через '+duration(due-clock())))
-    if any(grow_at(p)<=clock() for p in ps):
-        result.append(f'✅ Созрело: {sum(grow_at(p)<=clock() for p in ps)}')
+    if any(is_ready(p) for p in ps):
+        result.append(f'✅ Созрело: {sum(is_ready(p) for p in ps)}')
     return '\n'.join(result)
 def bar(value, blocks=10):
     filled = min(blocks, max(0, round(value * blocks / 100)))
@@ -167,7 +185,7 @@ def dashboard(user):
         ps = get_plants(user, g)
         fill = round(len(ps) * 100 / CAPACITY)
         avg = average_progress(ps)
-        active = [p for p in ps if grow_at(p) > now]
+        active = [p for p in ps if not is_ready(p)]
         ready = len(ps) - len(active)
         if active:
             nearest = min(due_at(p) for p in active)
@@ -186,7 +204,7 @@ def dashboard(user):
             lines.append(f'🎉 Готово к сбору: <b>{ready}</b>')
         lines.append('')
     if total:
-        active_all = [p for p in get_plants(user) if grow_at(p)>now]
+        active_all = [p for p in get_plants(user) if not is_ready(p)]
         due_count = sum(due_at(p)<=now for p in active_all)
         if due_count:
             lines.append(f'⚠️ Нужен полив: <b>{due_count} кустов</b>')
@@ -222,7 +240,6 @@ def settings_view(user):
 def garden_kb(g):
     return keyboard([[('➕ Посадить',f'add:{g}'),('📋 Кусты',f'list:{g}:0')],
                      [('💧 Полил огород',f'askw:{g}:all'),('💧 По культуре',f'wc:{g}')],
-                     [('🧴 Отметить гербицид',f'extra:{g}:0')],
                      [('✅ Собрать созревшие',f'askh:{g}')],
                      [('🧹 Очистить грядки',f'askclear:{g}')],
                      [('❌ Удалить огород',f'askdeletegarden:{g}')],
@@ -231,7 +248,7 @@ def crop_list(user,g,page):
     ps=get_plants(user,g); max_page=max(0,(len(ps)-1)//8); page=max(0,min(page,max_page))
     rows=[]; lines=[garden_summary(user,g),'',f'Кусты, страница {page+1}/{max_page+1}:']
     for p in ps[page*8:(page+1)*8]:
-        status=('✅ готов' if grow_at(p)<=clock() else
+        status=('✅ готов' if is_ready(p) else
                 '🚨 полив!' if due_at(p)<=clock() else f'💧 {duration(due_at(p)-clock())}')
         lines.append(f'#{p["id"]} {CROPS[p["crop"]][0]} • рост {progress(p)}% • {status}')
         rows.append([(f'💧 #{p["id"]}',f'w:{p["id"]}'),(f'✅ #{p["id"]}',f'h:{p["id"]}')])
@@ -255,7 +272,16 @@ def add_plants(user,g,crop,qty):
             if db.execute('SELECT 1 FROM plants WHERE user_id=? AND garden=? AND crop="carrot" LIMIT 1',(user,g)).fetchone():
                 db.execute('INSERT OR IGNORE INTO plant_extras(plant_id) SELECT id FROM plants WHERE user_id=? AND garden=? AND crop="pepper"',(user,g))
                 db.execute('UPDATE plant_extras SET carrot_bonus=1 WHERE plant_id IN (SELECT id FROM plants WHERE user_id=? AND garden=? AND crop="pepper")',(user,g))
+    if len(get_plants(user,g))==20:
+        mark_full_garden(user)
     return True
+def mark_full_garden(user):
+    with db:
+        row=db.execute('SELECT shovel_uses FROM settings WHERE user_id=?',(user,)).fetchone()
+        current=row['shovel_uses'] if row else 0
+        db.execute('UPDATE settings SET shovel_uses=? WHERE user_id=?',(current+1,user))
+        if (current+1)%20==0: spend_item(user,'shovel',1)
+        spend_item(user,'herbicide',5)
 def do_water(user,ps):
     # Save pre-action timestamps so the latest watering can be undone precisely.
     if not ps: return 0
@@ -263,10 +289,11 @@ def do_water(user,ps):
     with db:
         cur=db.execute('INSERT INTO water_actions(user_id,created_at) VALUES(?,?)',(user,t))
         action_id=cur.lastrowid
-        db.executemany('INSERT INTO water_action_items VALUES(?,?,?,?)',
-                       [(action_id,p['id'],p['watered_at'],t) for p in ps])
-        db.executemany('''UPDATE plants SET watered_at=?,warning_sent_for=0,due_sent_for=0
-                          WHERE user_id=? AND id=?''',[(t,user,p['id']) for p in ps])
+        db.executemany('''INSERT INTO water_action_items
+            (action_id,plant_id,prev_watered_at,new_watered_at,prev_grown_seconds,prev_growth_synced_at)
+            VALUES(?,?,?,?,?,?)''',[(action_id,p['id'],p['watered_at'],t,p['grown_seconds'],p['growth_synced_at']) for p in ps])
+        db.executemany('''UPDATE plants SET watered_at=?,grown_seconds=?,growth_synced_at=?,warning_sent_for=0,due_sent_for=0
+                          WHERE user_id=? AND id=?''',[(t,growth_seconds(p,t),t,user,p['id']) for p in ps])
     return len(ps)
 def undo_water(user):
     action=db.execute('SELECT * FROM water_actions WHERE user_id=? AND undone=0 ORDER BY id DESC LIMIT 1',(user,)).fetchone()
@@ -276,27 +303,12 @@ def undo_water(user):
     with db:
         for item in items:
             # Do not overwrite a newer watering action.
-            cur=db.execute('''UPDATE plants SET watered_at=?,warning_sent_for=0,due_sent_for=0
+            cur=db.execute('''UPDATE plants SET watered_at=?,grown_seconds=?,growth_synced_at=?,warning_sent_for=0,due_sent_for=0
                 WHERE user_id=? AND id=? AND watered_at=?''',
-                (item['prev_watered_at'],user,item['plant_id'],item['new_watered_at']))
+                (item['prev_watered_at'],item['prev_grown_seconds'],item['prev_growth_synced_at'],user,item['plant_id'],item['new_watered_at']))
             restored+=cur.rowcount
         db.execute('UPDATE water_actions SET undone=1 WHERE id=?',(action['id'],))
     return restored
-def extra_kb(user,g,page):
-    ps=get_plants(user,g); page=max(0,min(page,max(0,(len(ps)-1)//8)))
-    rows=[]; lines=[f'🧴 Удобрения • огород №{g}',
-                     'Компост обязателен и учитывается при посадке. Гербицид отмечай по факту появления.']
-    for p in ps[page*8:(page+1)*8]:
-        state=db.execute('SELECT compost,herbicide FROM plant_extras WHERE plant_id=?',(p['id'],)).fetchone()
-        c=True; h=bool(state and state['herbicide'])
-        lines.append(f'#{p["id"]} {CROPS[p["crop"]][0]}  компост: {"✅" if c else "—"}  гербицид: {"✅" if h else "—"}')
-        rows.append([(f'🧴 {"✅" if h else "Нужен"} #{p["id"]}',f'x:{p["id"]}:herbicide:{page}')])
-    nav=[]
-    if page>0: nav.append(('◀',f'extra:{g}:{page-1}'))
-    if (page+1)*8<len(ps): nav.append(('▶',f'extra:{g}:{page+1}'))
-    if nav: rows.append(nav)
-    rows.append([('⬅️ Огород',f'g:{g}')])
-    return '\n'.join(lines),keyboard(rows)
 STOCK_ITEMS = {
     'seed_pepper': '🌶️ Семена перца',
     'seed_carrot': '🥕 Семена моркови',
@@ -311,6 +323,16 @@ STOCK_ITEMS = {
     'herbicide': '🧴 Гербицид', 'peat': '🪴 Торф',
     'shovel': '🪏 Лопата',
 }
+def stock_items(user):
+    hidden={r[0] for r in db.execute('SELECT sku FROM hidden_stock_items WHERE user_id=?',(user,))}
+    result={sku:name for sku,name in STOCK_ITEMS.items() if sku not in hidden}
+    for r in db.execute('SELECT id,name FROM custom_stock_items WHERE user_id=? AND active=1 ORDER BY id',(user,)):
+        result['custom_'+str(r['id'])]='📎 '+r['name']
+    return result
+def item_name(user,sku):
+    return stock_items(user).get(sku,STOCK_ITEMS.get(sku,sku))
+def valid_item(user,sku): return sku in stock_items(user)
+
 def unit_price(user, sku):
     custom=db.execute('SELECT price FROM unit_prices WHERE user_id=? AND sku=?',(user,sku)).fetchone()
     return custom['price'] if custom else PRICES.get(sku)
@@ -319,10 +341,10 @@ def prices_menu(user):
     lines=['⚙️ <b>ЦЕНЫ МАТЕРИАЛОВ</b>','━━━━━━━━━━━━━━━━━━',
            'Выбери материал, чтобы изменить цену <b>за одну штуку</b>.',
            'При пополнении склада цена будет подставляться автоматически.\n']
-    for sku,name in STOCK_ITEMS.items():
+    for sku,name in stock_items(user).items():
         price=unit_price(user,sku)
         lines.append(f'{name}: <b>{money(price) if price is not None else "не задана ⚠️"}</b>')
-    return '\n'.join(lines), keyboard([[(name,f'price:{sku}')] for sku,name in STOCK_ITEMS]+[[('⬅️ Склад','stock')]])
+    return '\n'.join(lines), keyboard([[(name,f'price:{sku}')] for sku,name in stock_items(user).items()]+[[('⬅️ Склад','stock')]])
 
 def units(user,sku):
     return db.execute('SELECT COALESCE(SUM(quantity),0) FROM stock_moves WHERE user_id=? AND sku=?', (user,sku)).fetchone()[0]
@@ -334,12 +356,7 @@ def record_plant_costs(user,crops):
         spend_item(user,'seed_'+crop,n)
     spend_item(user,'lime',len(crops))
     spend_item(user,'compost',len(crops))
-    # Every 20 filled gardens costs one shovel use; shovel lasts 20 such uses.
-    settings=db.execute('SELECT shovel_uses FROM settings WHERE user_id=?',(user,)).fetchone()
-    current=settings['shovel_uses'] if settings else 0
-    if len(crops)==20:
-        db.execute('UPDATE settings SET shovel_uses=? WHERE user_id=?',(current+1,user))
-        if (current+1)%20==0: spend_item(user,'shovel',1)
+    # Shovel use and 5 herbicides are recorded when the garden reaches 20 plants.
 def plant_yield(user,p):
     if p['crop']!='pepper': return 0
     b=db.execute('SELECT carrot_bonus FROM plant_extras WHERE plant_id=?',(p['id'],)).fetchone()
@@ -358,7 +375,7 @@ def finance_menu(user):
     units_sold=db.execute('SELECT COALESCE(SUM(quantity),0) FROM sales WHERE user_id=?',(user,)).fetchone()[0]
     by_sku=db.execute('''SELECT sku,SUM(paid) AS total FROM stock_moves
                          WHERE user_id=? AND paid>0 GROUP BY sku ORDER BY total DESC''',(user,)).fetchall()
-    lines=[f'  • {STOCK_ITEMS.get(r["sku"],r["sku"])}: {money(r["total"])}' for r in by_sku]
+    lines=[f'  • {item_name(user,r["sku"])}: {money(r["total"])}' for r in by_sku]
     breakdown='\n'.join(lines) if lines else '  Пока не внесены'
     return (f'💰 <b>ФИНАНСЫ • RADMIR FARM</b>\n'
             f'━━━━━━━━━━━━━━━━━━\n'
@@ -376,14 +393,14 @@ def finance_menu(user):
             f'Неучтённые ранние покупки нужно внести вручную.</i>')
 def stock_menu(user):
     lines=['📦 <b>СКЛАД И ОПТОВЫЕ ЗАКУПКИ</b>','━━━━━━━━━━━━━━━━━━']
-    for sku,name in STOCK_ITEMS.items():
+    for sku,name in stock_items(user).items():
         n=units(user,sku)
         if n or sku in ('seed_pepper','seed_carrot','lime','compost','herbicide','shovel'):
             lines.append(f'{name}: <b>{n} шт.</b>'+(' ⚠️ нехватка / старые посадки' if n<0 else ''))
     lines.append('\n➕ Выбери материал и введи только количество. Стоимость рассчитается по сохранённой цене.\n'
                  '<i>Отрицательные остатки означают, что расход уже отмечен, но закупка не внесена.</i>')
-    rows=[[(name,f'buy:{sku}')] for sku,name in STOCK_ITEMS.items()]
-    rows += [[('⚙️ Настроить цены','prices')], [('💰 Финансы','finance'),('🏠 Меню','home')]]
+    rows=[[(name,f'buy:{sku}')] for sku,name in stock_items(user).items()]
+    rows += [[('➕ Новый товар','stockadd'),('🗑 Удалить товар','stockremove')], [('♻️ Вернуть скрытые','stockrestore')], [('⚙️ Настроить цены','prices')], [('💰 Финансы','finance'),('🏠 Меню','home')]]
     return '\n'.join(lines),keyboard(rows)
 
 def state_set(user,action,sku='',amount=0):
@@ -425,6 +442,14 @@ async def numerical_input(message: Message):
     if not allowed(u): return
     pending=db.execute('SELECT * FROM pending_inputs WHERE user_id=?',(u,)).fetchone()
     if not pending: return await message.answer('Открой меню командой /start')
+    if pending['action']=='custom_name':
+        name=(message.text or '').strip()
+        if not (1<=len(name)<=45) or any(c in name for c in '<>&'):
+            return await message.answer('Название: от 1 до 45 символов, без < и >.')
+        with db: db.execute('INSERT INTO custom_stock_items(user_id,name) VALUES(?,?)',(u,name))
+        state_clear(u)
+        text,kb=stock_menu(u)
+        return await message.answer('✅ Товар добавлен. Теперь настрой его цену через ⚙️ Настроить цены.\n\n'+text,parse_mode='HTML',reply_markup=kb)
     raw=(message.text or '').strip().replace(' ','').replace(',','.')
     try:
         value=float(raw)
@@ -446,20 +471,20 @@ async def numerical_input(message: Message):
                 db.execute('INSERT INTO stock_moves(user_id,sku,quantity,paid,created_at,note) VALUES (?,?,?,?,?,?)',
                            (u,sku,qty,total,clock(),'Пополнение по сохранённой цене'))
             state_clear(u)
-            return await message.answer(f'✅ <b>Склад пополнен!</b>\n{STOCK_ITEMS[sku]}\n📦 +{qty} шт.\n💳 Цена за шт.: {money(price)}\n💸 Учтённые расходы: <b>{money(total)}</b>\n📦 Остаток: {units(u,sku)} шт.',parse_mode='HTML',reply_markup=keyboard([[('📦 Склад','stock'),('💰 Финансы','finance')]]))
+            return await message.answer(f'✅ <b>Склад пополнен!</b>\n{item_name(u,sku)}\n📦 +{qty} шт.\n💳 Цена за шт.: {money(price)}\n💸 Учтённые расходы: <b>{money(total)}</b>\n📦 Остаток: {units(u,sku)} шт.',parse_mode='HTML',reply_markup=keyboard([[('📦 Склад','stock'),('💰 Финансы','finance')]]))
         state_set(u,'sale_price','',qty)
         return await message.answer(f'💵 Продано: <b>{qty} перцев</b>\nВведи <b>общую выручку от продажи</b> в рублях.',parse_mode='HTML')
     if action=='set_unit_price':
         with db:
             db.execute('INSERT OR REPLACE INTO unit_prices(user_id,sku,price) VALUES(?,?,?)',(u,pending['sku'],value))
         state_clear(u)
-        return await message.answer(f'✅ Цена сохранена: {STOCK_ITEMS[pending["sku"]]} — {money(value)} за 1 шт.',parse_mode='HTML',reply_markup=keyboard([[('⚙️ Цены','prices'),('📦 Склад','stock')]]))
+        return await message.answer(f'✅ Цена сохранена: {item_name(u,pending["sku"])} — {money(value)} за 1 шт.',parse_mode='HTML',reply_markup=keyboard([[('⚙️ Цены','prices'),('📦 Склад','stock')]]))
     if action=='buy_price':
         with db:
             db.execute('INSERT INTO stock_moves(user_id,sku,quantity,paid,created_at,note) VALUES (?,?,?,?,?,?)',
                        (u,pending['sku'],pending['amount'],value,clock(),'Оптовая закупка'))
         state_clear(u)
-        await message.answer(f'✅ <b>Закупка сохранена!</b>\n{STOCK_ITEMS[pending["sku"]]}\n'
+        await message.answer(f'✅ <b>Закупка сохранена!</b>\n{item_name(u,pending["sku"])}\n'
                              f'📦 +{pending["amount"]} шт.\n💸 Потрачено: {money(value)}\n'
                              f'💳 Цена за шт.: {money(value/pending["amount"])}',
                              parse_mode='HTML',reply_markup=keyboard([[('📦 Склад','stock'),('💰 Финансы','finance')]]))
@@ -511,6 +536,7 @@ async def actions(q: CallbackQuery):
                 record_plant_costs(u,['pepper']*19+['carrot'])
                 db.execute('INSERT OR IGNORE INTO plant_extras(plant_id) SELECT id FROM plants WHERE user_id=? AND garden=? AND crop="pepper"',(u,g))
                 db.execute('UPDATE plant_extras SET carrot_bonus=1 WHERE plant_id IN (SELECT id FROM plants WHERE user_id=? AND garden=? AND crop="pepper")',(u,g))
+            mark_full_garden(u)
             await edit(q,'✅ 19 перцев и 1 морковь добавлены.\n\n'+garden_summary(u,g),garden_kb(g))
         elif key=='add':
             g=int(args[1]); assert valid_garden(u,g)
@@ -599,30 +625,16 @@ async def actions(q: CallbackQuery):
                 db.execute('DELETE FROM plants WHERE user_id=? AND garden=?',(u,g))
                 db.execute('DELETE FROM gardens WHERE user_id=? AND num=?',(u,g))
             await edit(q,f'✅ Огород №{g} удалён.\n\n'+dashboard(u),home_kb(u))
-        elif key=='extra':
-            g=int(args[1]); assert valid_garden(u,g)
-            text,kb=extra_kb(u,g,int(args[2])); await edit(q,text,kb)
-        elif key=='x':
-            pid=int(args[1]); name=args[2]; page=int(args[3]); assert name=='herbicide'
-            p=get_plant(u,pid)
-            if not p: return await q.answer('Куст удалён',show_alert=True)
-            with db:
-                db.execute('INSERT OR IGNORE INTO plant_extras(plant_id) VALUES(?)',(pid,))
-                if name=='herbicide':
-                    old=db.execute('SELECT herbicide FROM plant_extras WHERE plant_id=?',(pid,)).fetchone()[0]
-                    spend_item(u,'herbicide',1 if not old else -1)
-                db.execute(f'UPDATE plant_extras SET {name}=1-{name} WHERE plant_id=?',(pid,))
-            text,kb=extra_kb(u,p['garden'],page); await edit(q,text,kb)
         elif key=='askh':
             g=int(args[1]); assert valid_garden(u,g)
-            ready=[p for p in get_plants(u,g) if grow_at(p)<=clock()]
+            ready=[p for p in get_plants(u,g) if is_ready(p)]
             if not ready: return await q.answer('Пока ничего не созрело',show_alert=True)
             await edit(q,f'Собрать {len(ready)} созревших кустов? Это удалит их из огорода.',
                        keyboard([[('✅ Собрал',f'doh:{g}'),('❌ Отмена',f'g:{g}')]]))
         elif key=='h':
             p=get_plant(u,int(args[1]))
             if not p: return await q.answer('Куст уже удалён',show_alert=True)
-            if grow_at(p)>clock(): return await q.answer('Ещё не созрел',show_alert=True)
+            if not is_ready(p): return await q.answer('Ещё не созрел',show_alert=True)
             with db:
                 archive_harvest(u,[p])
                 db.execute('DELETE FROM plant_extras WHERE plant_id=?',(p['id'],))
@@ -630,25 +642,59 @@ async def actions(q: CallbackQuery):
             await edit(q,'✅ Куст собран.\n'+garden_summary(u,p['garden']),garden_kb(p['garden']))
         elif key=='doh':
             g=int(args[1]); assert valid_garden(u,g)
-            ready=[p for p in get_plants(u,g) if grow_at(p)<=clock()]
+            ready=[p for p in get_plants(u,g) if is_ready(p)]
             ids=[p['id'] for p in ready]
             with db:
                 archive_harvest(u,ready)
                 db.executemany('DELETE FROM plant_extras WHERE plant_id=?',[(i,) for i in ids])
                 db.executemany('DELETE FROM plants WHERE id=? AND user_id=?',[(i,u) for i in ids])
             await edit(q,f'✅ Собрано {len(ids)} кустов.\n'+garden_summary(u,g),garden_kb(g))
+        elif key=='stockadd':
+            state_set(u,'custom_name')
+            await edit(q,'➕ <b>Новый товар</b>\nНапиши название товара одним сообщением (до 45 символов).',keyboard([[('❌ Отмена','stock')]]))
+        elif key=='stockrestore':
+            hidden=db.execute('SELECT sku FROM hidden_stock_items WHERE user_id=?',(u,)).fetchall()
+            custom=db.execute('SELECT id,name FROM custom_stock_items WHERE user_id=? AND active=0',(u,)).fetchall()
+            rows=[[(STOCK_ITEMS[r['sku']], f'stockrev:{r["sku"]}')] for r in hidden]
+            rows += [[('📎 '+r['name'],f'stockrev:custom_{r["id"]}')] for r in custom]
+            rows.append([('⬅️ Склад','stock')])
+            await edit(q,'♻️ <b>Вернуть скрытый товар</b>\nВыбери позицию для восстановления.' if len(rows)>1 else 'Нет скрытых товаров.',keyboard(rows))
+        elif key=='stockrev':
+            sku=args[1]
+            with db:
+                if sku.startswith('custom_'):
+                    db.execute('UPDATE custom_stock_items SET active=1 WHERE id=? AND user_id=?',(int(sku.split('_')[1]),u))
+                else:
+                    db.execute('DELETE FROM hidden_stock_items WHERE user_id=? AND sku=?',(u,sku))
+            text,kb=stock_menu(u)
+            await edit(q,'✅ Товар восстановлен.\n\n'+text,kb)
+        elif key=='stockremove':
+            items=[(name, f'stockdelask:{sku}') for sku,name in stock_items(u).items()]
+            await edit(q,'🗑 <b>Убрать товар со склада</b>\nЭто скроет позицию из меню, но сохранит старые закупки.',keyboard([[x] for x in items]+[[('⬅️ Назад','stock')]]))
+        elif key=='stockdelask':
+            sku=args[1]; assert valid_item(u,sku)
+            await edit(q,'⚠️ Убрать позицию «'+html.escape(item_name(u,sku))+'» из списка? История закупок останется.',keyboard([[('✅ Убрать',f'stockdel:{sku}')],[('❌ Отмена','stock')]]))
+        elif key=='stockdel':
+            sku=args[1]; assert valid_item(u,sku)
+            if sku.startswith('custom_'):
+                with db: db.execute('UPDATE custom_stock_items SET active=0 WHERE id=? AND user_id=?',(int(sku.split('_')[1]),u))
+            else:
+                # Built-in items cannot be removed from internal costs: hide them per user.
+                with db: db.execute('INSERT OR IGNORE INTO hidden_stock_items(user_id,sku) VALUES(?,?)',(u,sku))
+            text,kb=stock_menu(u)
+            await edit(q,'✅ Товар скрыт.\n\n'+text,kb)
         elif key=='stock':
             text,kb=stock_menu(u); await edit(q,text,kb)
         elif key=='prices':
             text,kb=prices_menu(u); await edit(q,text,kb)
         elif key=='price':
-            sku=args[1]; assert sku in STOCK_ITEMS
+            sku=args[1]; assert valid_item(u,sku)
             state_set(u,'set_unit_price',sku)
-            await edit(q,f'⚙️ <b>Цена: {STOCK_ITEMS[sku]}</b>\n\nТекущая цена: {money(unit_price(u,sku)) if unit_price(u,sku) is not None else "не задана"}\nНапиши цену <b>за 1 единицу</b> в рублях (например <code>262.5</code>).',keyboard([[('❌ Отмена','prices')]]))
+            await edit(q,f'⚙️ <b>Цена: {item_name(u,sku)}</b>\n\nТекущая цена: {money(unit_price(u,sku)) if unit_price(u,sku) is not None else "не задана"}\nНапиши цену <b>за 1 единицу</b> в рублях (например <code>262.5</code>).',keyboard([[('❌ Отмена','prices')]]))
         elif key=='buy':
-            sku=args[1]; assert sku in STOCK_ITEMS
+            sku=args[1]; assert valid_item(u,sku)
             state_set(u,'buy_qty',sku)
-            await edit(q,f'📦 <b>Закупка: {STOCK_ITEMS[sku]}</b>\n\nНапиши сообщением количество единиц, например <code>700</code>.',
+            await edit(q,f'📦 <b>Закупка: {item_name(u,sku)}</b>\n\nНапиши сообщением количество единиц, например <code>700</code>.',
                        keyboard([[('❌ Отмена','stock')]]))
         elif key=='sale':
             state_set(u,'sale_qty')
@@ -668,7 +714,7 @@ async def notifier(bot):
             batches={}; t=clock()
             for p in db.execute('SELECT * FROM plants ORDER BY user_id,garden,id'):
                 if not allowed(p['user_id']): continue
-                if grow_at(p)<=t:
+                if is_ready(p):
                     if not p['harvest_sent']:
                         batches.setdefault((p['user_id'],p['garden'],'harvest'),[]).append(p)
                     continue
